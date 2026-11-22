@@ -155,6 +155,10 @@ private:
     // and the bonus token in `fresh`, the number of accepted drafts in `accepted`
     void sampled_round(int32_t anchor, uint32_t pos, const SamplingParams& p, std::vector<int32_t>& drafts,
                        std::vector<int32_t>& fresh, uint32_t& accepted);
+    // Tree speculative decoding round (Sequoia best-first tree from DSpine::draft_table, greedy or lossless sampled)
+    void tree_round(Task& t, uint32_t pos, uint32_t tree_nodes);
+    void complete_tree_round(Task& t, uint32_t pos, const std::vector<int32_t>& win,
+                             const std::vector<int32_t>& fresh);
     double uniform() { return std::uniform_real_distribution<double>(0.0, 1.0)(rng_); }
     std::vector<float> prefill_from(const std::vector<int32_t>& prompt, GenerationResult& r,
                                     std::span<const Qwen35::ImageSpan> images);

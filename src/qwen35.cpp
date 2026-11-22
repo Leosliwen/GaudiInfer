@@ -2,6 +2,7 @@
 
 #include <perf_lib_layer_params.h>
 #include "g2e/direct_attn.hpp"
+#include "g2e/direct_tree.hpp"
 #include "g2e/direct_gdn.hpp"
 #include "g2e/gdn.hpp"
 #include "g2e/numeric.hpp"
@@ -204,6 +205,24 @@ struct Qwen35::DirectBatchState {
     std::array<std::unique_ptr<DirectGdnCommit>, 9> commits;
 };
 
+struct Qwen35::DirectTreeState {
+    uint32_t N = 0;
+    uint32_t built_limit = 0;
+    bool failed = false;
+    DirectTreeAssets assets;
+    struct Span {
+        std::unique_ptr<DirectTreeBlock> block;
+        DirectTreeBlockArgs args;
+        std::vector<uint32_t> gdn_layers;
+        int next_attn_layer = -1;
+        std::vector<std::pair<uint32_t, std::unique_ptr<DirectTreeAttnCore>>> attn_cache;
+        DirectTreeAttnCore* active_attn = nullptr;
+    };
+    std::vector<Span> spans;
+    std::unique_ptr<DirectTreeCommit> commit;
+    DirectTreeCommitArgs commit_args;
+};
+
 Qwen35::~Qwen35() = default;
 
 // Host-prepared weights: Gemma norms as bf16(1 + w), -exp(A_log) in F32, conv taps transposed to [4, C].
@@ -340,6 +359,7 @@ void Qwen35::load_state(const HostBuffer& src, uint64_t off, uint32_t pos) {
     }
     pos_ = pos;
     pending_T_ = 0;
+    pending_tree_N_ = 0;
     rope_delta_ = 0;
 }
 
@@ -474,6 +494,7 @@ void Qwen35::reset() {
     last_used_direct_b1_ = false;
     pos_ = 0;
     pending_T_ = 0;
+    pending_tree_N_ = 0;
     rope_delta_ = 0;
     rope_explicit_ = false;
     inject_.clear();
@@ -2031,6 +2052,27 @@ void Qwen35::precompile(const std::function<void(size_t, size_t)>& progress) {
             }
         }
     }
+    const char* tn_env = std::getenv("G2E_TREE_NODES");
+    const uint32_t tree_n = tn_env ? uint32_t(std::atoi(tn_env)) : 24u;
+    if (tree_n > 0 && tree_supported() && (tree_n == 24 || tree_n == 32 || tree_n == 48 || tree_n == 64)) {
+        verify_head_recipe(tree_n);
+        verify_topkb_recipe(tree_n);
+        if (!ensure_direct_tree(tree_n)) {
+            gdn_tree_recipe(tree_n);
+            attn_pre_recipe(tree_n);
+            for (uint32_t W : {512u, 1024u, 2048u, 4096u, 8192u}) {
+                atree_post_recipe(tree_n, W, false);
+                atree_post_recipe(tree_n, W, true);
+            }
+            for (uint32_t C : {8192u, 16384u}) {
+                attn_fp8_chunk_recipe(tree_n, C, true);
+                attn_fp8_chunk_recipe(tree_n, C, false);
+            }
+            embed_recipe(tree_n);
+            if (!capture_.empty()) capture_recipe(tree_n);
+            tree_commit_recipe(tree_n);
+        }
+    }
     ensure_direct_b1(max_ctx_);
 }
 
@@ -2077,6 +2119,7 @@ void Qwen35::set_capture(std::vector<uint32_t> layers) {
     if (!capture_.empty()) feats_ = DeviceBuffer(dev_, capture_.size() * feature_stride());
     direct_b8_.reset();
     direct_b1_.reset();
+    direct_tree_.reset();
 }
 
 std::vector<float> Qwen35::prefill(std::span<const int32_t> tokens, const std::function<void(uint32_t, uint32_t)>& on_chunk) {
@@ -3627,6 +3670,12 @@ void Qwen35::clear_direct_attn_caches() {
     };
     clear_state(direct_b1_.get());
     clear_state(direct_b8_.get());
+    if (direct_tree_) {
+        for (auto& sp : direct_tree_->spans) {
+            sp.active_attn = nullptr;
+            sp.attn_cache.clear();
+        }
+    }
 }
 
 bool Qwen35::ensure_direct_b8(std::array<uint32_t, 8> slot_caps) {
@@ -4579,6 +4628,987 @@ void Qwen35::run_layers(std::span<const int32_t> tokens, bool spec, std::vector<
         prof_.commit_ms = Event::elapsed_ms(*prof_ev_[prof_names.size()], eb);
     }
     (void)e1;
+}
+
+// ==============================================================================================================
+// Tree Speculative Verification Engine (N <= 64 unique prefix-tree nodes, 1x S0 read, 1x prefix KV read)
+// ==============================================================================================================
+
+bool Qwen35::tree_supported() const {
+    return block_ == 1 && wy_geometry() && fast_commit() && !k_cache_.empty() &&
+           cfg_.conv_kernel == 4 && cfg_.head_dim == 256 && cfg_.rotary_dim == 64 &&
+           cfg_.heads == 24 && cfg_.kv_heads == 4 && debug_layer_ < 0;
+}
+
+Qwen35::StashLayout Qwen35::tree_stash_layout(uint32_t N) const {
+    StashLayout L{};
+    const uint64_t NG = std::max(num_gdn_, 1u);
+    L.size[0] = uint64_t(N) * 2 * cfg_.lin_k_heads * cfg_.lin_k_dim * 4;
+    L.size[1] = 0;
+    L.size[2] = uint64_t(N) * cfg_.lin_v_heads * cfg_.lin_v_dim * 4;
+    L.size[3] = uint64_t(N) * cfg_.lin_v_heads * 4;
+    L.size[4] = 0;
+    L.size[5] = uint64_t(N + cfg_.conv_kernel - 1) * cfg_.conv_channels() * 2;
+    uint64_t off = 0;
+    for (int f = 0; f < 6; ++f) {
+        L.base[f] = off;
+        off = align128(off + NG * L.size[f]);
+    }
+    return L;
+}
+
+void Qwen35::ensure_tree_bufs(uint32_t N) {
+    if (!tree_ctl_.size()) tree_ctl_ = DeviceBuffer(dev_, kTreeCtlBytes);
+    if (!tree_direct_ctl_.size()) tree_direct_ctl_ = DeviceBuffer(dev_, kDTreeCtlBytes);
+    if (!capture_.empty() && !tree_feats_.size())
+        tree_feats_ = DeviceBuffer(dev_, capture_.size() * tree_feature_stride());
+    const auto L = tree_stash_layout(N);
+    const uint64_t NG = std::max(num_gdn_, 1u);
+    const uint64_t need_stash = L.base[5] + NG * L.size[5] + 128;
+    if (spec_stash_.size() < need_stash) spec_stash_ = DeviceBuffer(dev_, need_stash);
+}
+
+Recipe& Qwen35::gdn_tree_recipe(uint32_t N) {
+    const std::string key = "qwen35_gdntree_N" + std::to_string(N) +
+                            (gated_kernel() ? "_gk2" : "") + (fused_gate_quant() ? "_mq" : "");
+    if (auto it = recipes_.find(key); it != recipes_.end()) return *it->second;
+    const uint64_t H = cfg_.hidden, HK = cfg_.lin_k_heads, HV = cfg_.lin_v_heads, DK = cfg_.lin_k_dim,
+                   DV = cfg_.lin_v_dim, C = cfg_.conv_channels(), KC = cfg_.conv_kernel, REP = HV / HK;
+    const uint32_t j = 0;
+    GraphBuilder g(dev_);
+    Ops o(g);
+    build_inputs_.clear();
+    building_debug_j_ = -1;
+
+    const auto res_in = g.input("res_in", DType::BF16, {N, H});
+    const auto delta_in = g.input("delta_in", DType::BF16, {N, H});
+    const auto in_norm = g.input(P(j, "in_norm1p"), DType::BF16, {H});
+    const auto qkvz_w = g.input(P(j, "qkvz_w"), DType::F8, {C + HV * DV, H});
+    const auto qkvz_s = g.input(P(j, "qkvz_s"), DType::F32, {C + HV * DV});
+    const auto ba_w = g.input(P(j, "ba_w"), DType::BF16, {2 * HV, H});
+    const auto conv_w = g.input(P(j, "conv_t"), DType::BF16, {KC, C});
+    const auto negexpA = g.input(P(j, "negexpA"), DType::F32, {HV});
+    const auto dt_bias = g.input(P(j, "dt_bias"), DType::BF16, {HV});
+    const auto norm_w = g.input(P(j, "gdn_norm"), DType::BF16, {DV});
+    const auto out_w = g.input(P(j, "out_w"), DType::F8, {H, HV * DV});
+    const auto out_s = g.input(P(j, "out_s"), DType::F32, {H});
+    const auto conv_in = g.input(P(j, "conv_in"), DType::BF16, {KC - 1, C});
+    const auto ssm_in = g.input(P(j, "ssm_in"), DType::F32, {HV, DV, DK});
+    const auto tree_parent = g.input("tree_parent", DType::I32, {N});
+    const auto tree_conv_idx = g.input("tree_conv_idx", DType::I32, {N, 4});
+
+    const auto nq = o.add_rmsnorm_quant(delta_in, res_in, in_norm, cfg_.eps, P(j, "in"));
+    const auto qkvz = o.fp8_gemm(nq.codes, nq.scale, qkvz_w, qkvz_s, P(j, "qkvz"));
+    const auto pz = o.split(qkvz, 1, {C, HV * DV}, P(j, "qkvz_split"));
+    const auto ba = o.linear_bf16(nq.normalized, ba_w, P(j, "ba"), DType::F32);
+    const auto bap = o.split(ba, 1, {HV, HV}, P(j, "ba_split"));
+    const auto sp = o.unary("softplus", o.add(bap[1], o.cast(dt_bias, DType::F32, P(j, "dtbf")), P(j, "adt")), P(j, "sp"));
+    const auto gdecay = o.mul(sp, negexpA, P(j, "g"));
+    const auto beta = o.unary("sigmoid", bap[0], P(j, "beta"));
+
+    const auto seq = o.concat({conv_in, pz[0]}, 0, P(j, "seq"));
+    const auto X = o.temp(P(j, "wx"), DType::F32, {HK, 2 * uint64_t(N), DK});
+    const auto Vv = o.temp(P(j, "wv"), DType::F32, {N, HV * DV});
+    g.op("flashinfer_gaudi_gdn_tree_prep_bf16_gaudi2", {seq, conv_w, tree_conv_idx}, {X, Vv});
+    output(g, P(j, "st_x"), X);
+    output(g, P(j, "st_g"), gdecay);
+    output(g, P(j, "st_seq"), seq);
+
+    const auto gram = o.batch_gemm(X, X, P(j, "wgram"), false, true, DType::F32);
+    const auto rmat = o.batch_gemm(X, o.reshape(ssm_in, {HK, REP * DV, DK}, P(j, "ws3")), P(j, "wr"), false, true, DType::F32);
+    const auto core3 = o.temp(P(j, "wcore"), DType::F32, {N, HV, DV});
+    const auto ds3 = o.temp(P(j, "wds"), DType::F32, {N, HV, DV});
+    g.op("flashinfer_gaudi_gdn_tree_wy_f32_gaudi2",
+         {gdecay, beta, rmat, gram, o.reshape(Vv, {N, HV, DV}, P(j, "wv3")), tree_parent},
+         {core3, ds3});
+    output(g, P(j, "st_v"), ds3);
+    const auto core = o.cast(core3, DType::BF16, P(j, "core"));
+
+    Pair out;
+    if (gated_kernel() && DV == 128 && HV % 8 == 0) {
+        const auto z3 = o.reshape(pz[1], {N, HV, DV}, P(j, "z"));
+        const auto gated = o.temp(P(j, "gq_gated"), DType::BF16, {N, HV * DV});
+        const auto pmax = o.temp(P(j, "gq_pmax"), DType::F32, {N, HV / 8, 64});
+        const auto codes = o.temp(P(j, "gq_codes"), DType::F8, {N, HV * DV});
+        const auto scale = o.temp(P(j, "gq_scale"), DType::F32, {N, 1});
+        const float eps = cfg_.eps;
+        g.op("flashinfer_gaudi_gated_norm_quant_bf16_gaudi2", {core, z3, norm_w}, {gated, pmax}, &eps, sizeof(eps));
+        g.op("flashinfer_gaudi_row_quant_bf16_gaudi2", {gated, pmax}, {codes, scale});
+        out = proj_mlp(o, j, codes, scale, out_w, out_s, nq.residual_out, P(j, "outp"), true);
+    } else {
+        const auto normed = o.rms_norm(core, norm_w, cfg_.eps, false, P(j, "gnorm"));
+        const auto zs = o.temp(P(j, "zsilu"), DType::BF16, {N, HV, DV});
+        g.op("silu_fwd_bf16", {o.reshape(pz[1], {N, HV, DV}, P(j, "z"))}, {zs});
+        const auto q8 = o.mul_quant(o.reshape(zs, {N, HV * DV}, P(j, "zs2")),
+                                    o.reshape(normed, {N, HV * DV}, P(j, "nm2")), P(j, "gq"));
+        out = proj_mlp(o, j, q8.first, q8.second, out_w, out_s, nq.residual_out, P(j, "outp"), true);
+    }
+    output(g, "res_out", out.res);
+    output(g, "delta_out", out.delta);
+    auto r = g.compile(key);
+    return *(recipes_[key] = std::move(r));
+}
+
+Recipe& Qwen35::atree_post_recipe(uint32_t N, uint32_t W, bool has_prefix) {
+    const std::string key = "qwen35_atree_post_N" + std::to_string(N) + "_W" + std::to_string(W) +
+                            (has_prefix ? "_m" : "") + (kv8_ ? "_kv8" : "") + (fused_gate_quant() ? "_mq" : "");
+    if (auto it = recipes_.find(key); it != recipes_.end()) return *it->second;
+    const uint64_t H = cfg_.hidden, NH = cfg_.heads, KV = cfg_.kv_heads, D = cfg_.head_dim, G = NH / KV, R = G * N;
+    const uint32_t j = 0;
+    GraphBuilder g(dev_);
+    Ops o(g);
+    build_inputs_.clear();
+    building_debug_j_ = -1;
+
+    const auto q = g.input("q_in", DType::BF16, {N, NH, D});
+    const auto gate = g.input("gate_in", DType::BF16, {N, NH * D});
+    const auto resid = g.input("resid_in", DType::BF16, {N, H});
+    const auto o_w = g.input(P(j, "o_w"), DType::F8, {H, NH * D});
+    const auto o_s = g.input(P(j, "o_s"), DType::F32, {H});
+    const auto tail_posm1 = g.input("tail_posm1", DType::F32, {1, 1});
+    const auto iota_w = g.input("iota", DType::F32, {1, W});
+    const auto tree_mask = g.input("tree_mask", DType::F32, {N, N});
+
+    // Combined mask [1, N, W + N]: tail column c visible iff c <= tail_posm1; tree columns use tree_mask[i, j]
+    const auto tail_vis = o.mul(o.binary("min", o.sub(tail_posm1, iota_w, "tm_d"), o.constant(0.f, {1, 1}, "tm_z"), "tm_m"),
+                                o.constant(1e30f, {1, 1}, "tm_big"), "tm_c");
+    const auto tail_m = o.add(tail_vis, o.constant(0.f, {N, 1}, "tm_zt"), "tm_ct");
+    const auto mask_all = o.reshape(o.concat({tail_m, tree_mask}, 1, "tm_all"), {1, N, uint64_t(W) + N}, "tm_3");
+
+    const auto scale = o.constant(float(1.0 / std::sqrt(double(D))), {1}, "scale");
+    const auto qh = o.split(o.reshape(o.transpose(q, {1, 0, 2}, "qt"), {KV, R, D}, "q3"), 0, std::vector<uint64_t>(KV, 1), "qh");
+
+    std::vector<TensorId> outs;
+    outs.reserve(KV);
+    for (uint64_t h = 0; h < KV; ++h) {
+        const auto hs = std::to_string(h);
+        const auto q2 = o.reshape(qh[h], {R, D}, "q2_" + hs);
+        const auto k_tail = g.input("k_tail" + hs, kv_dt(), {W, D});
+        const auto v_tail = g.input("v_tail" + hs, kv_dt(), {W, D});
+        const auto k_new = g.input("k_new" + hs, kv_dt(), {N, D});
+        const auto v_new = g.input("v_new" + hs, kv_dt(), {N, D});
+
+        const auto sc_tail = kv_scores(o, q2, k_tail, "sct_" + hs);  // [R, W] BF16
+        const auto sc_tree = kv_scores(o, q2, k_new, "scn_" + hs);   // [R, N] BF16
+        const auto sc_f32 = o.cast(o.concat({sc_tail, sc_tree}, 1, "sc_" + hs), DType::F32, "scf_" + hs);
+        const auto s = o.add(o.mul(o.reshape(sc_f32, {G, N, uint64_t(W) + N}, "s3_" + hs), scale, "ss_" + hs),
+                             mask_all, "sm_" + hs);
+        const auto m_loc = o.reduce("max", s, 2, "mloc_" + hs);                         // [G, N, 1]
+        const auto e = o.unary("exp", o.sub(s, m_loc, "ds_" + hs), "ex_" + hs);         // [G, N, W + N]
+        const auto l_loc = o.reduce("sum", e, 2, "lloc_" + hs);                         // [G, N, 1]
+        const auto ep = o.split(o.cast(o.reshape(e, {R, uint64_t(W) + N}, "e2_" + hs), DType::BF16, "eb_" + hs),
+                                1, {W, N}, "ep_" + hs);
+        const auto ot = kv_pv(o, o.reshape(ep[0], {1, R, W}, "pt_" + hs), o.reshape(v_tail, {1, W, D}, "vt_" + hs), "ot_" + hs);
+        const auto on = kv_pv(o, o.reshape(ep[1], {1, R, N}, "pn_" + hs), o.reshape(v_new, {1, N, D}, "vn_" + hs), "on_" + hs);
+        const auto o_num = o.reshape(o.add(ot, on, "os_" + hs), {R, D}, "onum_" + hs);
+        const auto l_flat = o.reshape(l_loc, {R, 1}, "lf_" + hs);
+        const auto m_flat = o.reshape(m_loc, {R, 1}, "mf_" + hs);
+        const auto den = kv8_ ? o.mul(l_flat, o.constant(128.f, {1}, "c128_" + hs), "d8_" + hs) : l_flat;
+        const auto o_loc = o.div(o_num, den, "oloc_" + hs);  // [R, D] F32
+
+        TensorId oh;
+        if (has_prefix) {
+            const auto o_in = g.input("o_in" + hs, DType::F32, {R, D});
+            const auto m_in = g.input("m_in" + hs, DType::F32, {R, 1});
+            const auto l_in = g.input("l_in" + hs, DType::F32, {R, 1});
+            const auto M = o.binary("max", m_in, m_flat, "mm_" + hs);
+            const auto wa = o.mul(l_in, o.unary("exp", o.sub(m_in, M, "dma_" + hs), "ema_" + hs), "wa_" + hs);
+            const auto wb = o.mul(l_flat, o.unary("exp", o.sub(m_flat, M, "dmb_" + hs), "emb_" + hs), "wb_" + hs);
+            const auto num = o.add(o.mul(o_in, wa, "na_" + hs), o.mul(o_loc, wb, "nb_" + hs), "nn_" + hs);
+            oh = o.cast(o.div(num, o.add(wa, wb, "ws_" + hs), "om_" + hs), DType::BF16, "ob_" + hs);
+        } else {
+            oh = o.cast(o_loc, DType::BF16, "ob_" + hs);
+        }
+        outs.push_back(o.reshape(oh, {1, R, D}, "oh3_" + hs));
+    }
+
+    const auto att2 = o.reshape(o.transpose(o.reshape(o.concat(outs, 0, "oall"), {NH, N, D}, "a3"), {1, 0, 2}, "at"),
+                                {N, NH * D}, "a2");
+    std::pair<TensorId, TensorId> q8;
+    if (fused_gate_quant()) {
+        q8 = o.mul_quant(o.unary("sigmoid", gate, "gsig"), att2, "gq");
+    } else {
+        q8 = o.quantize(o.mul(att2, o.unary("sigmoid", gate, "gsig"), "gated"), "gq");
+    }
+    const auto out = proj_mlp(o, j, q8.first, q8.second, o_w, o_s, resid, P(j, "oproj"), true);
+    output(g, "res_out", out.res);
+    output(g, "delta_out", out.delta);
+    auto r = g.compile(key);
+    return *(recipes_[key] = std::move(r));
+}
+
+Recipe& Qwen35::tree_commit_recipe(uint32_t N) {
+    const std::string key = "qwen35_treecommit_N" + std::to_string(N) + (kv8_ ? "_kv8" : "") +
+                            "_cap" + std::to_string(capture_.size());
+    if (auto it = recipes_.find(key); it != recipes_.end()) return *it->second;
+    const uint64_t HK = cfg_.lin_k_heads, HV = cfg_.lin_v_heads, DK = cfg_.lin_k_dim, DV = cfg_.lin_v_dim,
+                   C = cfg_.conv_channels(), KC = cfg_.conv_kernel, NG = num_gdn_,
+                   NA = k_cache_.size(), KV = cfg_.kv_heads, D = cfg_.head_dim, H = cfg_.hidden;
+    const uint64_t D_bf16 = kv8_ ? (D / 2) : D;
+    GraphBuilder g(dev_);
+    Ops o(g);
+    build_inputs_.clear();
+
+    const auto path_ctl = g.input("path_ctl", DType::I32, {17});
+    const auto win16 = g.input("win16", DType::I32, {kSpecMaxT});
+    const auto conv_rows = g.input("conv_rows", DType::I32, {KC - 1});
+
+    // 1. GDN state + conv commit
+    const auto ssm_in = g.input("ssm_in", DType::F32, {NG * HV, DV, DK});
+    const auto x = g.input("x", DType::F32, {NG, HK, 2 * uint64_t(N), DK});
+    const auto ds = g.input("v", DType::F32, {NG, N, HV, DV});
+    const auto gd = g.input("g", DType::F32, {NG, N, HV});
+    const auto s_next = o.temp("ssm_next", DType::F32, {NG * HV, DV, DK});
+    g.op("flashinfer_gaudi_gdn_tree_commit_f32_gaudi2", {ssm_in, x, ds, gd, path_ctl}, {s_next});
+    output(g, "ssm_out", s_next);
+    const auto seq = g.input("seq", DType::BF16, {NG, uint64_t(N) + KC - 1, C});
+    output(g, "conv_out", o.gather(seq, conv_rows, 1, "win_conv"));
+
+    // 2. Attention KV cache commit (gather winning 16 rows per layer/kv/head via BF16 bit-copy)
+    const auto tree_kv = g.input("tree_kv", DType::BF16, {NA * 2 * KV, N, D_bf16});
+    const auto kv_win = o.gather(tree_kv, win16, 1, "kv_win");
+    const auto kv_parts = o.split(kv_win, 0, std::vector<uint64_t>(NA * 2 * KV, 1), "kv_sp");
+    for (uint64_t n = 0; n < NA * 2 * KV; ++n) {
+        const auto out = g.input("c" + std::to_string(n), DType::BF16, {kSpecMaxT, D_bf16});
+        g.reshape(kv_parts[n], out);
+    }
+
+    // 3. Captured drafter features gather into contiguous [16, H] rows
+    for (size_t k = 0; k < capture_.size(); ++k) {
+        const auto fi = g.input("feat_in" + std::to_string(k), DType::BF16, {N, H});
+        output(g, "feat_out" + std::to_string(k), o.gather_rows(fi, win16, "fwin" + std::to_string(k)));
+    }
+
+    auto r = g.compile(key);
+    return *(recipes_[key] = std::move(r));
+}
+
+Qwen35::DirectTreeState* Qwen35::ensure_direct_tree(uint32_t N) {
+    if (N != 24u && N != 32u && N != 48u) return nullptr;
+    static const bool off = std::getenv("G2E_NO_DIRECT_TREE") != nullptr;
+    if (off || layer_limit_ || !tree_supported()) return nullptr;
+    const uint32_t nl = cfg_.layers;
+    if (!ensure_direct_shared(nl)) return nullptr;
+    ensure_tree_bufs(std::max(N, 48u));
+    if (direct_tree_ && direct_tree_->N == N && direct_tree_->built_limit == nl)
+        return direct_tree_->failed ? nullptr : direct_tree_.get();
+    direct_tree_ = std::make_unique<DirectTreeState>();
+    direct_tree_->N = N;
+    direct_tree_->built_limit = nl;
+    try {
+        const std::string env_key = "G2E_MME_DESC_DIR_R" + std::to_string(N);
+        const char* dd = std::getenv(env_key.c_str());
+        const char* td = std::getenv("G2E_TPC_OBJ_DIR");
+        const std::string desc_dir = (dd && *dd) ? dd
+            : (std::string(G2E_SOURCE_DIR) + "/tools/mme_descs_R" + std::to_string(N));
+        const std::string tpc_dir = (td && *td) ? td : std::string(G2E_TPC_OBJ_DIR);
+        direct_tree_->assets = DirectTreeAssets::load(*direct_shared_->rt, desc_dir, tpc_dir, N);
+
+        const uint64_t H = cfg_.hidden, F = cfg_.intermediate, C = cfg_.conv_channels(), D = cfg_.head_dim, KV = cfg_.kv_heads;
+        const auto& sc_off = direct_shared_->sc_off;
+        auto feat_for = [&](uint32_t layer_idx) -> uint64_t {
+            for (size_t k = 0; k < capture_.size(); ++k)
+                if (capture_[k] == layer_idx) return feats_.address() + uint64_t(k) * feature_stride();
+            return 0;
+        };
+
+        auto make_gdn_w = [&](uint32_t i) {
+            DirectGdnLayerWeights dw{};
+            dw.in_norm1p = aux_.address() + aux_off_.at(L(i, "in_norm1p"));
+            dw.post_norm1p = aux_.address() + aux_off_.at(L(i, "post_norm1p"));
+            const auto qkvz_w = w_.bind("qkvz_w", L(i, "qkvz.w"));
+            const auto ba_w = w_.bind("ba_w", L(i, "ba"));
+            const auto dt_bias = w_.bind("dt_bias", L(i, "dt_bias"));
+            const auto gdn_norm = w_.bind("gdn_norm", L(i, "gdn_norm"));
+            const auto out_w = w_.bind("out_w", L(i, "out.w"));
+            const auto gu_w = w_.bind("gu_w", L(i, "gate_up.w"));
+            const auto dn_w = w_.bind("dn_w", L(i, "down.w"));
+            dw.qkv_w = qkvz_w.buffer->address() + qkvz_w.offset;
+            dw.z_w = dw.qkv_w + C * H;
+            dw.qkv_s_int = direct_shared_->scales_buf.address() + sc_off.at(L(i, "qkvz.s"));
+            dw.z_s_int = dw.qkv_s_int + C * 4;
+            dw.ba_w = ba_w.buffer->address() + ba_w.offset;
+            dw.conv_t = aux_.address() + aux_off_.at(L(i, "conv_t"));
+            dw.dt_bias = dt_bias.buffer->address() + dt_bias.offset;
+            dw.negexpA = aux_.address() + aux_off_.at(L(i, "negexpA"));
+            dw.gdn_norm = gdn_norm.buffer->address() + gdn_norm.offset;
+            dw.out_w = out_w.buffer->address() + out_w.offset;
+            dw.out_s_int = direct_shared_->scales_buf.address() + sc_off.at(L(i, "out.s"));
+            dw.gate_w = gu_w.buffer->address() + gu_w.offset;
+            dw.up_w = dw.gate_w + F * H;
+            dw.gate_s_int = direct_shared_->scales_buf.address() + sc_off.at(L(i, "gate_up.s"));
+            dw.up_s_int = dw.gate_s_int + F * 4;
+            dw.dn_w = dn_w.buffer->address() + dn_w.offset;
+            dw.dn_s_int = direct_shared_->scales_buf.address() + sc_off.at(L(i, "down.s"));
+            dw.feat_out = feat_for(i);
+            return dw;
+        };
+
+        auto make_apost_w = [&](uint32_t i) {
+            DirectApostLayerWeights aw{};
+            aw.post_norm1p = aux_.address() + aux_off_.at(L(i, "post_norm1p"));
+            const auto ow = w_.bind("o_w", L(i, "o.w"));
+            const auto gw = w_.bind("gu_w", L(i, "gate_up.w"));
+            const auto dnw = w_.bind("dn_w", L(i, "down.w"));
+            aw.o_w = ow.buffer->address() + ow.offset;
+            aw.o_s_int = direct_shared_->scales_buf.address() + sc_off.at(L(i, "o.s"));
+            aw.gate_w = gw.buffer->address() + gw.offset;
+            aw.up_w = aw.gate_w + F * H;
+            aw.gate_s_int = direct_shared_->scales_buf.address() + sc_off.at(L(i, "gate_up.s"));
+            aw.up_s_int = aw.gate_s_int + F * 4;
+            aw.dn_w = dnw.buffer->address() + dnw.offset;
+            aw.dn_s_int = direct_shared_->scales_buf.address() + sc_off.at(L(i, "down.s"));
+            aw.feat_out = feat_for(i);
+            return aw;
+        };
+
+        auto make_apre_w = [&](uint32_t i) {
+            DirectTreeApreWeights ap{};
+            const uint32_t s = uint32_t(slot_[i]);
+            ap.in_norm1p = aux_.address() + aux_off_.at(L(i, "in_norm1p"));
+            const auto qkvw = w_.bind("qkv_w", L(i, "qkv.w"));
+            const auto qn = w_.bind("q_norm", L(i, "q_norm"));
+            const auto kn = w_.bind("k_norm", L(i, "k_norm"));
+            ap.qkv_w = qkvw.buffer->address() + qkvw.offset;
+            ap.qkv_s_int = direct_shared_->scales_buf.address() + sc_off.at(L(i, "qkv.s"));
+            ap.q_norm = qn.buffer->address() + qn.offset;
+            ap.k_norm = kn.buffer->address() + kn.offset;
+            ap.rope_pos = tree_direct_ctl_.address() + kDTreeOffRopePos;
+            ap.cos_tab = cos_tab_.address();
+            ap.sin_tab = sin_tab_.address();
+            ap.rope_tab_rows = max_ctx_;
+            const uint64_t kv_slice = uint64_t(N) * D * kv_es();
+            ap.k_hbm = kv_scratch_.address() + (uint64_t(s) * 2 * KV) * kv_slice;
+            ap.v_hbm = kv_scratch_.address() + (uint64_t(s) * 2 * KV + KV) * kv_slice;
+            ap.kv8 = kv8_;
+            return ap;
+        };
+
+        const auto Ls = tree_stash_layout(N);
+        const uint64_t sb = direct_shared_->rt->sram_base();
+        const auto emb = w_.bind("embed", "embed");
+        uint32_t i = 0;
+        while (i < nl) {
+            DirectTreeState::Span sp;
+            bool has_apost = false;
+            DirectApostLayerWeights apost_w{};
+            if (cfg_.attention[i]) {
+                has_apost = true;
+                apost_w = make_apost_w(i);
+                ++i;
+            }
+            std::vector<DirectGdnLayerWeights> gdn_ws;
+            while (i < nl && !cfg_.attention[i]) {
+                sp.gdn_layers.push_back(i);
+                gdn_ws.push_back(make_gdn_w(i));
+                ++i;
+            }
+            bool has_apre = false;
+            DirectTreeApreWeights apre_w{};
+            if (i < nl && cfg_.attention[i]) {
+                has_apre = true;
+                sp.next_attn_layer = int(i);
+                apre_w = make_apre_w(i);
+            }
+            const bool is_span0 = direct_tree_->spans.empty();
+            sp.args.tree_parent = tree_direct_ctl_.address() + kDTreeOffParent;
+            sp.args.tree_conv_idx = tree_direct_ctl_.address() + kDTreeOffConvIdx;
+            if (is_span0 && !has_apost) {
+                sp.args.embed_ids = tree_direct_ctl_.address() + kDTreeOffIds;
+                sp.args.embed_table = emb.buffer->address() + emb.offset;
+                sp.args.embed_vocab = cfg_.vocab;
+            }
+            sp.args.gate_in = sb + kDirectSramGateOff;
+            sp.args.att_in = sb + kDirectSramAttOff;
+            sp.args.resid_in = sb + kDirectSramResidOff;
+            sp.args.res_out = res_[1].address();
+            sp.args.delta_out = delta_[1].address();
+            const size_t n_gdn = sp.gdn_layers.size();
+            sp.args.conv_in.resize(n_gdn);
+            sp.args.ssm_in.resize(n_gdn);
+            sp.args.st_x.resize(n_gdn);
+            sp.args.st_v.resize(n_gdn);
+            sp.args.st_g.resize(n_gdn);
+            sp.args.st_seq.resize(n_gdn);
+            for (size_t j = 0; j < n_gdn; ++j) {
+                const uint32_t s = uint32_t(slot_[sp.gdn_layers[j]]);
+                sp.args.conv_in[j] = conv_all_[0].address() + uint64_t(s) * conv_bytes_;
+                sp.args.ssm_in[j] = ssm_all_[0].address() + uint64_t(s) * ssm_bytes_;
+                sp.args.st_x[j] = spec_stash_.address() + Ls.base[0] + uint64_t(s) * Ls.size[0];
+                sp.args.st_v[j] = spec_stash_.address() + Ls.base[2] + uint64_t(s) * Ls.size[2];
+                sp.args.st_g[j] = spec_stash_.address() + Ls.base[3] + uint64_t(s) * Ls.size[3];
+                sp.args.st_seq[j] = spec_stash_.address() + Ls.base[5] + uint64_t(s) * Ls.size[5];
+            }
+            sp.block = std::make_unique<DirectTreeBlock>(*direct_shared_->rt, direct_tree_->assets, gdn_ws, sp.args,
+                                                         0xa, has_apost ? &apost_w : nullptr,
+                                                         has_apre ? &apre_w : nullptr, kDirectSramWorkOff);
+            direct_tree_->spans.push_back(std::move(sp));
+        }
+        std::fprintf(stderr, "[g2e] Unified 64-layer Direct MME+SRAM Tree engine active (N=%u): %zu spans (64 layers, kv=%s)\n",
+                     N, direct_tree_->spans.size(), kv8_ ? "FP8" : "BF16");
+        return direct_tree_.get();
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "[g2e] Direct Tree (N=%u) fallback to Synapse (%s)\n", N, e.what());
+        direct_tree_->failed = true;
+        return nullptr;
+    }
+}
+
+void Qwen35::run_tree_layers(const TreeSpec& tree) {
+    const uint32_t N = uint32_t(tree.tokens.size());
+    if (!tree_supported()) throw std::logic_error("qwen35: tree verification not supported for this model config");
+    if (N < 2 || N > 64) throw std::invalid_argument("qwen35: tree size must be 2..64");
+    if (tree.parent.size() != N || tree.depth.size() != N || tree.parent[0] != -1 || tree.depth[0] != 0)
+        throw std::invalid_argument("qwen35: invalid TreeSpec");
+    if (pos_ + kSpecMaxT > cap_) throw std::out_of_range("qwen35: context full for tree verification");
+    ensure_tree_bufs(N);
+    last_tree_direct_ = false;
+    last_tree_direct_ms_ = 0.0;
+
+    // Fast path: Unified 64-layer Direct MME+SRAM Tree Engine (N=32 or N=48)
+    bool rope_ok = !rope_explicit_;
+    for (uint32_t i = 0; i < N && rope_ok; ++i) {
+        const int64_t rp = int64_t(pos_) + int64_t(tree.depth[i]) + rope_delta_;
+        if (rp < 0 || rp >= int64_t(max_ctx_)) rope_ok = false;
+    }
+    const uint32_t min_rows = std::max<uint32_t>(1024u, ((pos_ + 1023u) / 1024u) * 1024u);
+    const uint32_t want_rows = (pos_ + 256u <= 1024u) ? 1024u : (((pos_ + 256u + 2047u) / 2048u) * 2048u);
+    const uint32_t cap_rows = (cap_ / 1024u) * 1024u;
+    const uint32_t need_rows = (cap_rows >= min_rows) ? std::min(want_rows, cap_rows) : min_rows;
+    DirectTreeState* dt = (rope_ok && need_rows <= cap_) ? ensure_direct_tree(N) : nullptr;
+    if (dt) {
+        using clk = std::chrono::steady_clock;
+        static const bool prof_dt = std::getenv("G2E_VERIFY_PROF") != nullptr;
+        const auto td0 = clk::now();
+        const uint64_t D = cfg_.head_dim, KV = cfg_.kv_heads;
+        const uint64_t sb = direct_shared_->rt->sram_base();
+        const auto Ls = tree_stash_layout(N);
+
+        // Pack 1920-byte Direct Tree control block in host staging buffer
+        auto* ctl = staging_.as<uint8_t>() + kTreeStage;
+        auto* ids_p = reinterpret_cast<int32_t*>(ctl + kDTreeOffIds);
+        auto* par_p = reinterpret_cast<int32_t*>(ctl + kDTreeOffParent);
+        auto* cidx_p = reinterpret_cast<int32_t*>(ctl + kDTreeOffConvIdx);
+        auto* pos_p = reinterpret_cast<int32_t*>(ctl + kDTreeOffPosInt);
+        auto* rpos_p = reinterpret_cast<int32_t*>(ctl + kDTreeOffRopePos);
+        *pos_p = int32_t(pos_);
+        for (uint32_t i = 0; i < N; ++i) {
+            ids_p[i] = tree.tokens[i];
+            par_p[i] = tree.parent[i];
+            rpos_p[i] = int32_t(int64_t(pos_) + int64_t(tree.depth[i]) + rope_delta_);
+            const int p1 = tree.parent[i];
+            const int p2 = (p1 >= 0) ? tree.parent[size_t(p1)] : -1;
+            const int p3 = (p2 >= 0) ? tree.parent[size_t(p2)] : -1;
+            cidx_p[i * 4 + 0] = (p3 >= 0) ? (3 + p3) : ((p2 >= 0) ? 2 : ((p1 >= 0) ? 1 : 0));
+            cidx_p[i * 4 + 1] = (p2 >= 0) ? (3 + p2) : ((p1 >= 0) ? 2 : 1);
+            cidx_p[i * 4 + 2] = (p1 >= 0) ? (3 + p1) : 2;
+            cidx_p[i * 4 + 3] = 3 + int(i);
+        }
+
+        std::vector<DirectPlan*> all_plans;
+        all_plans.reserve(64);
+        bool dt_ok = false;
+        for (int attempt = 0; attempt < 2 && !dt_ok; ++attempt) {
+            all_plans.clear();
+            try {
+                for (auto& sp : dt->spans) {
+                    for (size_t j = 0; j < sp.gdn_layers.size(); ++j) {
+                        const uint32_t s = uint32_t(slot_[sp.gdn_layers[j]]);
+                        sp.args.conv_in[j] = conv_all_[conv_side_[s]].address() + uint64_t(s) * conv_bytes_;
+                        sp.args.ssm_in[j] = ssm_all_[ssm_side_[s]].address() + uint64_t(s) * ssm_bytes_;
+                        sp.args.st_x[j] = spec_stash_.address() + Ls.base[0] + uint64_t(s) * Ls.size[0];
+                        sp.args.st_v[j] = spec_stash_.address() + Ls.base[2] + uint64_t(s) * Ls.size[2];
+                        sp.args.st_g[j] = spec_stash_.address() + Ls.base[3] + uint64_t(s) * Ls.size[3];
+                        sp.args.st_seq[j] = spec_stash_.address() + Ls.base[5] + uint64_t(s) * Ls.size[5];
+                    }
+                    sp.block->update_args(sp.args);
+                    all_plans.push_back(sp.block->plan());
+                    if (sp.next_attn_layer >= 0) {
+                        const int s = slot_[uint32_t(sp.next_attn_layer)];
+                        DirectTreeAttnArgs aargs{};
+                        aargs.q_prefix = sb + kDirectSramQOff;
+                        aargs.q_bf = sb + kDirectTreeSramQBfOff;
+                        aargs.k_tree_bf = sb + kDirectTreeSramKTOff;
+                        aargs.v_tree_f32 = sb + kDirectTreeSramVTOff;
+                        aargs.att_out = sb + kDirectSramAttOff;
+                        aargs.pos_buf = tree_direct_ctl_.address() + kDTreeOffPosInt;
+                        aargs.parent = tree_direct_ctl_.address() + kDTreeOffParent;
+                        for (uint64_t h = 0; h < KV; ++h) {
+                            const uint64_t head = h * uint64_t(cap_) * D * kv_es();
+                            aargs.k_cache[h] = k_cache_[s].address() + head;
+                            aargs.v_cache[h] = v_cache_[s].address() + head;
+                        }
+                        DirectTreeAttnCore* core = nullptr;
+                        for (auto& entry : sp.attn_cache) {
+                            if (entry.first == need_rows) { core = entry.second.get(); break; }
+                        }
+                        if (!core) {
+                            sp.active_attn = nullptr;
+                            sp.attn_cache.clear();
+                            auto created = std::make_unique<DirectTreeAttnCore>(*direct_shared_->rt, dt->assets, kv8_,
+                                                                                need_rows, aargs, kDirectSramWorkOff, 0xa);
+                            core = created.get();
+                            sp.attn_cache.emplace_back(need_rows, std::move(created));
+                        } else {
+                            core->update_args(aargs);
+                        }
+                        sp.active_attn = core;
+                        core->collect_plans(all_plans);
+                    }
+                }
+                dt_ok = true;
+            } catch (const std::exception& e) {
+                clear_direct_attn_caches();
+                if (attempt == 1)
+                    std::fprintf(stderr, "[g2e] Direct Tree attn_core fallback to Synapse (rows=%u: %s)\n", need_rows, e.what());
+            }
+        }
+        if (dt_ok) {
+            if (!last_used_direct_b1_) stream_.synchronize();
+            direct_shared_->rt->flush_patches_and_upload(all_plans, tree_direct_ctl_.address(), ctl, kDTreeFwdBytes);
+            const double patch_ms = std::chrono::duration<double, std::milli>(clk::now() - td0).count();
+            double exec_ms = 0.0;
+            if (direct_shared_->rt->chain_enabled()) {
+                exec_ms = direct_shared_->rt->run_chain(all_plans) * 1e-3;
+            } else {
+                for (auto& sp : dt->spans) {
+                    exec_ms += sp.block->run() * 1e-3;
+                    if (sp.active_attn) exec_ms += sp.active_attn->run() * 1e-3;
+                }
+            }
+            if (prof_dt)
+                std::fprintf(stderr, "verify_direct_tree (64L N=%u rows=%u): patch %.2f ms  exec %.2f ms  total %.2f ms\n",
+                             N, need_rows, patch_ms, exec_ms, patch_ms + exec_ms);
+            cur_ = 1;
+            last_used_direct_b1_ = true;
+            last_tree_direct_ = true;
+            last_tree_direct_ms_ = patch_ms + exec_ms;
+            return;
+        }
+    }
+
+    ensure_fp8_chunk_bufs();
+    last_used_direct_b1_ = false;
+
+    const uint64_t R2 = cfg_.rotary_dim / 2, D = cfg_.head_dim, KV = cfg_.kv_heads, G = cfg_.heads / KV;
+    const uint64_t R = G * N;
+    const uint64_t o_stride = R * D * 4;
+    const uint64_t ml_stride = ((R * 4 + 255) / 256) * 256;
+
+    // 1. Determine prefix chunking [0 .. chunk_end) + tail [chunk_end .. chunk_end + W)
+    std::vector<uint32_t> chunks;
+    uint32_t chunk_end = 0;
+    while (pos_ - chunk_end >= 16384u) { chunks.push_back(16384u); chunk_end += 16384u; }
+    if (pos_ - chunk_end >= 8192u) { chunks.push_back(8192u); chunk_end += 8192u; }
+    const uint32_t rem = pos_ - chunk_end;
+    uint32_t W = 512u;
+    if (rem > 4096u) W = 8192u;
+    else if (rem > 2048u) W = 4096u;
+    else if (rem > 1024u) W = 2048u;
+    else if (rem > 512u) W = 1024u;
+    if (chunk_end + W > cap_) W = cap_ - chunk_end;
+
+    // 2. Pack and upload ids_, tree_ctl_ (parent, conv_idx, tail_posm1, tree_mask), and rope_cs_ (cos/sin)
+    if (stage_ev_ && stage_ev_->recorded()) stage_ev_->synchronize();
+    {
+        auto* ids = reinterpret_cast<int32_t*>(staging_.as<uint8_t>() + kIdsStage);
+        for (uint32_t i = 0; i < N; ++i) ids[i] = tree.tokens[i];
+        stream_.upload(staging_, kIdsStage, ids_, 0, uint64_t(N) * 4);
+
+        auto* ctl = staging_.as<uint8_t>() + kTreeStage;
+        auto* par = reinterpret_cast<int32_t*>(ctl + kTreeOffParent);
+        auto* cidx = reinterpret_cast<int32_t*>(ctl + kTreeOffConvIdx);
+        auto* tpos = reinterpret_cast<float*>(ctl + kTreeOffTailPos);
+        auto* mask = reinterpret_cast<float*>(ctl + kTreeOffMask);
+        *tpos = float(rem) - 1.f;
+        for (uint32_t i = 0; i < N; ++i) {
+            par[i] = tree.parent[i];
+            const int p1 = tree.parent[i];
+            const int p2 = (p1 >= 0) ? tree.parent[size_t(p1)] : -1;
+            const int p3 = (p2 >= 0) ? tree.parent[size_t(p2)] : -1;
+            cidx[i * 4 + 0] = (p3 >= 0) ? (3 + p3) : ((p2 >= 0) ? 2 : ((p1 >= 0) ? 1 : 0));
+            cidx[i * 4 + 1] = (p2 >= 0) ? (3 + p2) : ((p1 >= 0) ? 2 : 1);
+            cidx[i * 4 + 2] = (p1 >= 0) ? (3 + p1) : 2;
+            cidx[i * 4 + 3] = 3 + int(i);
+            for (uint32_t j = 0; j < N; ++j) mask[uint64_t(i) * N + j] = -1e30f;
+            for (int cur = int(i); cur >= 0; cur = tree.parent[size_t(cur)])
+                mask[uint64_t(i) * N + uint64_t(cur)] = 0.f;
+        }
+        stream_.upload(staging_, kTreeStage, tree_ctl_, 0, kTreeOffMask + uint64_t(N) * N * 4);
+
+        // Compute per-node RoPE cos/sin using each node's depth (at most 16 unique positions!)
+        const uint64_t cs_bytes = align128(uint64_t(N) * R2 * 4);
+        auto* rbase = staging_.as<uint8_t>() + kTreeStage + 32768;
+        auto* cos_out = reinterpret_cast<float*>(rbase);
+        auto* sin_out = reinterpret_cast<float*>(rbase + cs_bytes);
+        float c_dep[16][64], s_dep[16][64];
+        bool dep_done[16]{};
+        for (uint32_t i = 0; i < N; ++i) {
+            const uint32_t d = tree.depth[i];
+            if (!dep_done[d]) {
+                dep_done[d] = true;
+                const double p = double(int64_t(pos_) + int64_t(d) + rope_delta_);
+                for (uint64_t k = 0; k < R2; ++k) {
+                    const double inv = std::pow(cfg_.rope_theta, -double(2 * k) / double(cfg_.rotary_dim));
+                    c_dep[d][k] = float(std::cos(p * inv));
+                    s_dep[d][k] = float(std::sin(p * inv));
+                }
+            }
+            std::memcpy(cos_out + uint64_t(i) * R2, c_dep[d], R2 * 4);
+            std::memcpy(sin_out + uint64_t(i) * R2, s_dep[d], R2 * 4);
+        }
+        stream_.upload(staging_, kTreeStage + 32768, rope_cs_, 0, 2 * cs_bytes);
+    }
+
+    // 3. Embed N tree tokens
+    {
+        const Binding eb[] = {{"ids", &ids_, 0}, w_.bind("embed", "embed"), {"res", &res_[0], 0}};
+        embed_recipe(N).enqueue(stream_, eb);
+    }
+    if (!stage_ev_) stage_ev_ = std::make_unique<Event>(dev_);
+    stage_ev_->record(stream_);
+
+    const auto Ls = tree_stash_layout(N);
+    const uint64_t cs_bytes = align128(uint64_t(N) * R2 * 4);
+    const uint64_t kv_slice = uint64_t(N) * D * kv_es();
+    const uint32_t nlayers = layer_limit_ ? std::min(layer_limit_, cfg_.layers) : cfg_.layers;
+
+    auto bind_w = [&](std::vector<Binding>& v, const std::string& name, const std::string& weight) {
+        v.push_back(w_.bind(P(0, name), weight));
+    };
+    auto bind_aux = [&](std::vector<Binding>& v, const std::string& name, const std::string& key) {
+        v.push_back({P(0, name), &aux_, aux_off_.at(key)});
+    };
+
+    int cur = 0;
+    for (uint32_t i = 0; i < nlayers; ++i) {
+        const DeviceBuffer& delta_in = i ? delta_[cur] : zero_;
+        if (!cfg_.attention[i]) {
+            const uint32_t s = uint32_t(slot_[i]);
+            auto& r = gdn_tree_recipe(N);
+            std::vector<Binding> b = {{"res_in", &res_[cur], 0},
+                                      {"delta_in", &delta_in, 0},
+                                      {"res_out", &res_[cur ^ 1], 0},
+                                      {"delta_out", &delta_[cur ^ 1], 0},
+                                      {"tree_parent", &tree_ctl_, kTreeOffParent},
+                                      {"tree_conv_idx", &tree_ctl_, kTreeOffConvIdx},
+                                      {P(0, "conv_in"), &conv_all_[conv_side_[s]], uint64_t(s) * conv_bytes_},
+                                      {P(0, "ssm_in"), &ssm_all_[ssm_side_[s]], uint64_t(s) * ssm_bytes_},
+                                      {P(0, "st_x"), &spec_stash_, Ls.base[0] + uint64_t(s) * Ls.size[0]},
+                                      {P(0, "st_v"), &spec_stash_, Ls.base[2] + uint64_t(s) * Ls.size[2]},
+                                      {P(0, "st_g"), &spec_stash_, Ls.base[3] + uint64_t(s) * Ls.size[3]},
+                                      {P(0, "st_seq"), &spec_stash_, Ls.base[5] + uint64_t(s) * Ls.size[5]}};
+            bind_aux(b, "in_norm1p", L(i, "in_norm1p"));
+            bind_aux(b, "post_norm1p", L(i, "post_norm1p"));
+            bind_w(b, "gu_w", L(i, "gate_up.w"));
+            bind_w(b, "gu_s", L(i, "gate_up.s"));
+            bind_w(b, "down_w", L(i, "down.w"));
+            bind_w(b, "down_s", L(i, "down.s"));
+            bind_w(b, "qkvz_w", L(i, "qkvz.w"));
+            bind_w(b, "qkvz_s", L(i, "qkvz.s"));
+            bind_w(b, "ba_w", L(i, "ba"));
+            bind_aux(b, "conv_t", L(i, "conv_t"));
+            bind_aux(b, "negexpA", L(i, "negexpA"));
+            bind_w(b, "dt_bias", L(i, "dt_bias"));
+            bind_w(b, "gdn_norm", L(i, "gdn_norm"));
+            bind_w(b, "out_w", L(i, "out.w"));
+            bind_w(b, "out_s", L(i, "out.s"));
+            r.enqueue(stream_, b);
+        } else {
+            const uint32_t s = uint32_t(slot_[i]);
+            {
+                auto& pr = attn_pre_recipe(N);
+                std::vector<Binding> pb = {{"res_in", &res_[cur], 0},
+                                           {"delta_in", &delta_in, 0},
+                                           {"cos", &rope_cs_, 0},
+                                           {"sin", &rope_cs_, cs_bytes},
+                                           {"q_out", &apre_q_, 0},
+                                           {"gate_out", &apre_g_, 0},
+                                           {"resid_out", &apre_r_, 0}};
+                bind_aux(pb, "in_norm1p", L(i, "in_norm1p"));
+                bind_w(pb, "qkv_w", L(i, "qkv.w"));
+                bind_w(pb, "qkv_s", L(i, "qkv.s"));
+                bind_w(pb, "q_norm", L(i, "q_norm"));
+                bind_w(pb, "k_norm", L(i, "k_norm"));
+                for (uint64_t h = 0; h < KV; ++h) {
+                    const uint64_t ko = (uint64_t(s) * 2 * KV + h) * kv_slice;
+                    const uint64_t vo = (uint64_t(s) * 2 * KV + KV + h) * kv_slice;
+                    pb.push_back({"k_out" + std::to_string(h), &kv_scratch_, ko});
+                    pb.push_back({"v_out" + std::to_string(h), &kv_scratch_, vo});
+                }
+                pr.enqueue(stream_, pb);
+            }
+            int side = 0;
+            uint32_t off = 0;
+            for (size_t ci = 0; ci < chunks.size(); ++ci) {
+                const uint32_t C = chunks[ci];
+                const bool is_first = (ci == 0);
+                auto& cr = attn_fp8_chunk_recipe(N, C, is_first);
+                std::vector<Binding> cb = {{"f8_one", &aux_, aux_off_.at("f8_one")},
+                                           {"f8_s128", &aux_, aux_off_.at("f8_s128")},
+                                           {"f8_d128", &aux_, aux_off_.at("f8_d128")}};
+                if (is_first) {
+                    cb.push_back({"q_in", &apre_q_, 0});
+                    cb.push_back({"q8_out", fp8_q8_.get(), 0});
+                } else {
+                    cb.push_back({"q8_in", fp8_q8_.get(), 0});
+                }
+                const int dst = is_first ? 0 : (side ^ 1);
+                for (uint64_t h = 0; h < KV; ++h) {
+                    const auto hs = std::to_string(h);
+                    const uint64_t kv_off = (h * uint64_t(cap_) + off) * D * kv_es();
+                    cb.push_back({"k_in" + hs, &k_cache_[s], kv_off});
+                    cb.push_back({"v_in" + hs, &v_cache_[s], kv_off});
+                    if (!is_first) {
+                        cb.push_back({"o_in" + hs, fp8_o_[side].get(), h * o_stride});
+                        cb.push_back({"m_in" + hs, fp8_m_[side].get(), h * ml_stride});
+                        cb.push_back({"l_in" + hs, fp8_l_[side].get(), h * ml_stride});
+                    }
+                    cb.push_back({"o_out" + hs, fp8_o_[dst].get(), h * o_stride});
+                    cb.push_back({"m_out" + hs, fp8_m_[dst].get(), h * ml_stride});
+                    cb.push_back({"l_out" + hs, fp8_l_[dst].get(), h * ml_stride});
+                }
+                cr.enqueue(stream_, cb);
+                side = dst;
+                off += C;
+            }
+            const bool has_prefix = !chunks.empty();
+            auto& qr = atree_post_recipe(N, W, has_prefix);
+            std::vector<Binding> qb = {{"q_in", &apre_q_, 0},
+                                       {"gate_in", &apre_g_, 0},
+                                       {"resid_in", &apre_r_, 0},
+                                       {"res_out", &res_[cur ^ 1], 0},
+                                       {"delta_out", &delta_[cur ^ 1], 0},
+                                       {"tail_posm1", &tree_ctl_, kTreeOffTailPos},
+                                       {"iota", &aux_, aux_off_.at("iota")},
+                                       {"tree_mask", &tree_ctl_, kTreeOffMask}};
+            bind_aux(qb, "post_norm1p", L(i, "post_norm1p"));
+            bind_w(qb, "gu_w", L(i, "gate_up.w"));
+            bind_w(qb, "gu_s", L(i, "gate_up.s"));
+            bind_w(qb, "down_w", L(i, "down.w"));
+            bind_w(qb, "down_s", L(i, "down.s"));
+            bind_w(qb, "o_w", L(i, "o.w"));
+            bind_w(qb, "o_s", L(i, "o.s"));
+            for (uint64_t h = 0; h < KV; ++h) {
+                const auto hs = std::to_string(h);
+                const uint64_t tail_off = (h * uint64_t(cap_) + chunk_end) * D * kv_es();
+                const uint64_t ko = (uint64_t(s) * 2 * KV + h) * kv_slice;
+                const uint64_t vo = (uint64_t(s) * 2 * KV + KV + h) * kv_slice;
+                qb.push_back({"k_tail" + hs, &k_cache_[s], tail_off});
+                qb.push_back({"v_tail" + hs, &v_cache_[s], tail_off});
+                qb.push_back({"k_new" + hs, &kv_scratch_, ko});
+                qb.push_back({"v_new" + hs, &kv_scratch_, vo});
+                if (has_prefix) {
+                    qb.push_back({"o_in" + hs, fp8_o_[side].get(), h * o_stride});
+                    qb.push_back({"m_in" + hs, fp8_m_[side].get(), h * ml_stride});
+                    qb.push_back({"l_in" + hs, fp8_l_[side].get(), h * ml_stride});
+                }
+            }
+            qr.enqueue(stream_, qb);
+        }
+        cur ^= 1;
+        for (size_t k = 0; k < capture_.size(); ++k) {
+            if (capture_[k] == i) {
+                const Binding cb[] = {{"res", &res_[cur], 0},
+                                      {"delta", &delta_[cur], 0},
+                                      {"feat", &feats_, uint64_t(k) * feature_stride()}};
+                capture_recipe(N).enqueue(stream_, cb);
+            }
+        }
+    }
+    cur_ = cur;
+}
+
+std::vector<int32_t> Qwen35::verify_tree(const TreeSpec& tree) {
+    if (pending_T_ || pending_total_ || pending_tree_N_)
+        throw std::logic_error("qwen35: accept() the pending verification first");
+    const uint32_t N = uint32_t(tree.tokens.size());
+    Event e0(dev_), e1(dev_);
+    e0.record(stream_);
+    run_tree_layers(tree);
+    auto& hr = verify_head_recipe(N);
+    std::vector<Binding> hb = {{"res", &res_[cur_], 0},
+                               {"delta", &delta_[cur_], 0},
+                               {"final_norm1p", &aux_, aux_off_.at("final_norm1p")},
+                               w_.bind("lm_head", "lm_head")};
+    if (lm8_on_) {
+        hb.push_back({"lm8", &lm8_, 0});
+        hb.push_back({"lm8s", &lm8s_, 0});
+        hb.push_back({"tkc_consts", &aux_, aux_off_.at("topk2c_T" + std::to_string(N))});
+        hb.push_back({"cand8", &argmax_, 0});
+        hb.push_back({"best", &argmax_, kBestOff});
+    } else {
+        hb.push_back({"argmax", &argmax_, 0});
+    }
+    hr.enqueue(stream_, hb);
+    e1.record(stream_);
+    stream_.download(argmax_, 0, staging_, 0, lm8_on_ ? kBestOff + uint64_t(N) * 4 : uint64_t(N) * 4);
+    if (!done_ev_) done_ev_ = std::make_unique<Event>(dev_);
+    done_ev_->record(stream_);
+    done_ev_->synchronize();
+    last_ms_ = last_tree_direct_ms_ + Event::elapsed_ms(e0, e1);
+    pending_tree_N_ = N;
+    if (lm8_on_) {
+        const auto* cand = staging_.as<int32_t>();
+        const auto* best = reinterpret_cast<const int32_t*>(staging_.as<uint8_t>() + kBestOff);
+        std::vector<int32_t> out(N);
+        for (uint32_t t = 0; t < N; ++t) out[t] = cand[t * kHeadCand + uint32_t(best[t])];
+        return out;
+    }
+    return std::vector<int32_t>(staging_.as<int32_t>(), staging_.as<int32_t>() + N);
+}
+
+Qwen35::VerifyTop Qwen35::verify_tree_topk(const TreeSpec& tree, float inv_temp) {
+    if (pending_T_ || pending_total_ || pending_tree_N_)
+        throw std::logic_error("qwen35: accept() the pending verification first");
+    const uint32_t N = uint32_t(tree.tokens.size());
+    Event e0(dev_), e1(dev_);
+    e0.record(stream_);
+    run_tree_layers(tree);
+    {
+        auto* tv = reinterpret_cast<float*>(staging_.as<uint8_t>() + kTempStage);
+        for (uint32_t i = 0; i < N; ++i) tv[i] = inv_temp;
+        stream_.upload(staging_, kTempStage, tempb_, 0, uint64_t(N) * 4);
+    }
+    auto& hr = verify_topkb_recipe(N);
+    std::vector<Binding> hb = {{"res", &res_[cur_], 0},
+                               {"delta", &delta_[cur_], 0},
+                               {"final_norm1p", &aux_, aux_off_.at("final_norm1p")},
+                               w_.bind("lm_head", "lm_head"),
+                               {"inv_temp", &tempb_, 0},
+                               {"tk_consts", &aux_, aux_off_.at("topk2_T" + std::to_string(N))},
+                               {"top_v", &vtopb_, 0},
+                               {"top_i", &vtopb_, kVtbIds},
+                               {"mx", &vtopb_, kVtbMax},
+                               {"sum", &vtopb_, kVtbSum}};
+    hr.enqueue(stream_, hb);
+    e1.record(stream_);
+    stream_.download(vtopb_, 0, staging_, 0, kVtbEnd);
+    if (!done_ev_) done_ev_ = std::make_unique<Event>(dev_);
+    done_ev_->record(stream_);
+    done_ev_->synchronize();
+    last_ms_ = last_tree_direct_ms_ + Event::elapsed_ms(e0, e1);
+    pending_tree_N_ = N;
+    VerifyTop v;
+    const auto* base = staging_.as<uint8_t>();
+    const auto* vals = reinterpret_cast<const float*>(base);
+    const auto* ids = reinterpret_cast<const int32_t*>(base + kVtbIds);
+    const auto* mx = reinterpret_cast<const float*>(base + kVtbMax);
+    const auto* sm = reinterpret_cast<const float*>(base + kVtbSum);
+    v.values.assign(vals, vals + uint64_t(N) * kTopK);
+    v.ids.assign(ids, ids + uint64_t(N) * kTopK);
+    v.max.assign(mx, mx + N);
+    v.sum.assign(sm, sm + N);
+    return v;
+}
+
+void Qwen35::accept_tree(std::span<const int32_t> win_nodes) {
+    if (!pending_tree_N_) throw std::logic_error("qwen35: accept_tree() without a pending tree verification");
+    const uint32_t N = pending_tree_N_;
+    const uint32_t L = uint32_t(win_nodes.size());
+    if (L == 0 || L > kSpecMaxT) throw std::invalid_argument("qwen35: accept_tree win_nodes length must be 1..16");
+    const uint32_t a = L - 1;
+
+    auto* base = staging_.as<uint8_t>() + kTreeCommitStage;
+    auto* pctl = reinterpret_cast<int32_t*>(base);
+    auto* win16 = reinterpret_cast<int32_t*>(base + 128);
+    auto* crows = reinterpret_cast<int32_t*>(base + 256);
+    pctl[0] = int32_t(a);
+    for (uint32_t t = 0; t < kSpecMaxT; ++t) {
+        const int32_t nd = t < L ? win_nodes[t] : win_nodes[a];
+        pctl[1 + t] = nd;
+        win16[t] = nd;
+    }
+    std::vector<int32_t> full = {0, 1, 2};
+    for (uint32_t t = 0; t < L; ++t) full.push_back(3 + win_nodes[t]);
+    for (uint32_t k = 0; k + 1 < cfg_.conv_kernel; ++k)
+        crows[k] = full[full.size() - (cfg_.conv_kernel - 1) + k];
+
+    // Fast path: Direct SCAL Tree Commit (in-place GDN SSM + conv + KV + features in ONE SCAL submission, ~0.25 ms!)
+    bool same_sides = !ssm_side_.empty();
+    for (size_t i = 1; i < ssm_side_.size() && same_sides; ++i)
+        if (ssm_side_[i] != ssm_side_[0] || conv_side_[i] != conv_side_[0]) same_sides = false;
+    if (last_tree_direct_ && same_sides && direct_tree_ && !direct_tree_->failed && direct_tree_->N == N &&
+        direct_shared_ && !direct_shared_->failed && num_gdn_ > 0 && cfg_.conv_kernel == 4) {
+        // Pack {path_ctl (128B), conv_rows (128B), commit_pos (128B)} at kTreeCommitStage + 512
+        auto* dbase = staging_.as<uint8_t>() + kTreeCommitStage + 512;
+        std::memcpy(dbase, pctl, 128);
+        std::memcpy(dbase + 128, crows, 128);
+        *reinterpret_cast<int32_t*>(dbase + 256) = int32_t(pos_);
+
+        const auto Ls = tree_stash_layout(N);
+        DirectTreeCommitArgs cargs{};
+        cargs.ssm = ssm_all_[ssm_side_[0]].address();
+        cargs.conv_out = conv_all_[conv_side_[0]].address();
+        cargs.x = spec_stash_.address() + Ls.base[0];
+        cargs.v = spec_stash_.address() + Ls.base[2];
+        cargs.g = spec_stash_.address() + Ls.base[3];
+        cargs.seq = spec_stash_.address() + Ls.base[5];
+        cargs.path_ctl = tree_direct_ctl_.address() + kDTreeOffPathCtl;
+        cargs.conv_rows = tree_direct_ctl_.address() + kDTreeOffConvRows;
+        cargs.pos_buf = tree_direct_ctl_.address() + kDTreeOffCommitPos;
+        cargs.kv_scratch = kv_scratch_.address();
+        cargs.kv_cap = cap_;
+        cargs.k_cache.resize(k_cache_.size());
+        cargs.v_cache.resize(v_cache_.size());
+        for (size_t s = 0; s < k_cache_.size(); ++s) {
+            cargs.k_cache[s] = k_cache_[s].address();
+            cargs.v_cache[s] = v_cache_[s].address();
+        }
+        cargs.feat_layers = uint32_t(capture_.size());
+        if (cargs.feat_layers > 0) {
+            cargs.feat_in = feats_.address();
+            cargs.feat_out = tree_feats_.address();
+            cargs.feat_in_stride_elems = uint32_t(feature_stride() / 2);
+            cargs.feat_out_stride_elems = uint32_t(tree_feature_stride() / 2);
+        }
+        if (!direct_tree_->commit || direct_tree_->commit->built_cap() != cap_ ||
+            direct_tree_->commit->built_feat_layers() != cargs.feat_layers) {
+            direct_tree_->commit = std::make_unique<DirectTreeCommit>(
+                *direct_shared_->rt, direct_tree_->assets, num_gdn_, uint32_t(k_cache_.size()), kv8_, cargs, 0xa);
+        } else {
+            direct_tree_->commit->update_args(cargs);
+        }
+        DirectPlan* cplan[1] = {direct_tree_->commit->plan()};
+        direct_shared_->rt->flush_patches_and_upload(cplan, tree_direct_ctl_.address() + kDTreeOffCommitBase,
+                                                     dbase, kDTreeCommitBytes);
+        direct_tree_->commit->run();
+        pending_tree_N_ = 0;
+        pos_ += L;
+        return;
+    }
+
+    stream_.upload(staging_, kTreeCommitStage, tree_ctl_, kTreeOffPathCtl, 384);
+
+    const auto Ls = tree_stash_layout(N);
+    const uint64_t KV = cfg_.kv_heads, D = cfg_.head_dim;
+    std::vector<Binding> b = {{"path_ctl", &tree_ctl_, kTreeOffPathCtl},
+                              {"win16", &tree_ctl_, kTreeOffWin16},
+                              {"conv_rows", &tree_ctl_, kTreeOffConvRows},
+                              {"x", &spec_stash_, Ls.base[0]},
+                              {"v", &spec_stash_, Ls.base[2]},
+                              {"g", &spec_stash_, Ls.base[3]},
+                              {"seq", &spec_stash_, Ls.base[5]},
+                              {"ssm_in", &ssm_all_[ssm_side_[0]], 0},
+                              {"ssm_out", &ssm_all_[ssm_side_[0] ^ 1], 0},
+                              {"conv_out", &conv_all_[conv_side_[0] ^ 1], 0},
+                              {"tree_kv", &kv_scratch_, 0}};
+    for (size_t s = 0; s < k_cache_.size(); ++s)
+        for (uint64_t kv = 0; kv < 2; ++kv)
+            for (uint64_t h = 0; h < KV; ++h) {
+                const uint64_t at = (h * uint64_t(cap_) + pos_) * D * kv_es();
+                b.push_back({"c" + std::to_string((s * 2 + kv) * KV + h), kv ? &v_cache_[s] : &k_cache_[s], at});
+            }
+    for (size_t k = 0; k < capture_.size(); ++k) {
+        b.push_back({"feat_in" + std::to_string(k), &feats_, uint64_t(k) * feature_stride()});
+        b.push_back({"feat_out" + std::to_string(k), &tree_feats_, uint64_t(k) * tree_feature_stride()});
+    }
+    tree_commit_recipe(N).enqueue(stream_, b);
+
+    for (auto& side : ssm_side_) side ^= 1;
+    for (auto& side : conv_side_) side ^= 1;
+    pending_tree_N_ = 0;
+    pos_ += L;
 }
 
 }  // namespace g2e

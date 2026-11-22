@@ -13,7 +13,7 @@ find_package(Threads REQUIRED)
 # Custom TPC kernels (GDN decode/verify, fused norm+quant, ...), loaded through GC_KERNEL_PATH at runtime.
 add_subdirectory(tpc/flashinfer_gaudi)
 
-add_library(g2e_core STATIC src/runtime.cpp src/graph.cpp src/weights.cpp src/ops.cpp src/qwen35.cpp src/gdn.cpp src/dspine.cpp src/generator.cpp src/vision.cpp src/image.cpp src/prefix_cache.cpp src/direct_mme.cpp src/direct_gdn.cpp src/direct_attn.cpp)
+add_library(g2e_core STATIC src/runtime.cpp src/graph.cpp src/weights.cpp src/ops.cpp src/qwen35.cpp src/gdn.cpp src/dspine.cpp src/generator.cpp src/vision.cpp src/image.cpp src/prefix_cache.cpp src/direct_mme.cpp src/direct_gdn.cpp src/direct_attn.cpp src/direct_tree.cpp)
 target_include_directories(g2e_core PUBLIC include)
 target_include_directories(g2e_core SYSTEM PRIVATE third_party
     /usr/include/habanalabs /usr/include/drm

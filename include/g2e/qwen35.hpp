@@ -64,6 +64,7 @@ public:
     void clear_pending() {
         if (pending_T_ && pending_total_) --pending_total_;
         pending_T_ = 0;
+        pending_tree_N_ = 0;
     }
     // Prefix cache support (g2e/prefix_cache.hpp). All copies are queued on the model's stream (ordered with the
     // forwards); host buffers must stay alive until the stream passed them.
@@ -133,6 +134,21 @@ public:
         std::vector<float> max, sum;  // [T]
     };
     VerifyTop verify_topk(std::span<const int32_t> tokens, float inv_temp, const std::function<void()>& launched = {});
+    // Tree speculative verification: verify an N-node prefix tree (N <= 64, topological order: parent[0] = -1,
+    // 0 <= parent[i] < i, depth[i] <= 15) sharing the current slot's prefix KV & GDN state in a single pass.
+    struct TreeSpec {
+        std::vector<int32_t> tokens;    // [N] tokens[0] = anchor
+        std::vector<int32_t> parent;    // [N] parent[0] = -1, 0 <= parent[i] < i
+        std::vector<uint32_t> depth;    // [N] depth[0] = 0, depth[i] = depth[parent[i]] + 1
+    };
+    std::vector<int32_t> verify_tree(const TreeSpec& tree);
+    VerifyTop verify_tree_topk(const TreeSpec& tree, float inv_temp);
+    // Commit winning root-to-node path `win_nodes` (1..16 nodes, win_nodes[0] = 0) of the pending tree verification:
+    // updates GDN states, GDN conv windows, attention KV caches, and gathers captured features into tree_features().
+    void accept_tree(std::span<const int32_t> win_nodes);
+    const DeviceBuffer& tree_features() const { return tree_feats_; }
+    uint64_t tree_feature_stride() const { return uint64_t(kSpecMaxT) * cfg_.hidden * 2; }
+    bool tree_supported() const;
     // Whole prompt: chunks of 64 tokens, then the remainder as 32/16/8/4/2/1-token pieces. Returns the last logits.
     // `on_chunk(pos, n)` runs after every chunk (the captured features of those n rows are in features()).
     // Build (or load from the recipe cache) every recipe a request up to max_context can need: prefill pieces,
@@ -345,16 +361,53 @@ private:
     bool profile_ = false;
     Profile prof_;
     std::vector<std::unique_ptr<Event>> prof_ev_;
+    // Tree speculative verification (N <= 64 unique tree nodes, 1x S0, 1x prefix KV read)
+    Recipe& gdn_tree_recipe(uint32_t N);
+    Recipe& atree_post_recipe(uint32_t N, uint32_t W, bool has_prefix);
+    Recipe& tree_commit_recipe(uint32_t N);
+    StashLayout tree_stash_layout(uint32_t N) const;
+    void ensure_tree_bufs(uint32_t N);
+    void run_tree_layers(const TreeSpec& tree);
+    static constexpr uint64_t kTreeStage = 2u << 20;
+    static constexpr uint64_t kTreeCommitStage = 3u << 20;
+    static constexpr uint64_t kTreeOffParent = 0;
+    static constexpr uint64_t kTreeOffConvIdx = 256;
+    static constexpr uint64_t kTreeOffTailPos = 1280;
+    static constexpr uint64_t kTreeOffMask = 1408;
+    static constexpr uint64_t kTreeOffPathCtl = 17792;
+    static constexpr uint64_t kTreeOffWin16 = 17920;
+    static constexpr uint64_t kTreeOffConvRows = 18048;
+    static constexpr uint64_t kTreeCtlBytes = 20480;
+    static constexpr uint64_t kDTreeOffIds = 0;
+    static constexpr uint64_t kDTreeOffParent = 256;
+    static constexpr uint64_t kDTreeOffConvIdx = 512;
+    static constexpr uint64_t kDTreeOffPosInt = 1536;
+    static constexpr uint64_t kDTreeOffRopePos = 1664;
+    static constexpr uint64_t kDTreeFwdBytes = 1920;
+    static constexpr uint64_t kDTreeOffCommitBase = 2048;
+    static constexpr uint64_t kDTreeOffPathCtl = 2048;
+    static constexpr uint64_t kDTreeOffConvRows = 2176;
+    static constexpr uint64_t kDTreeOffCommitPos = 2304;
+    static constexpr uint64_t kDTreeCommitBytes = 384;
+    static constexpr uint64_t kDTreeCtlBytes = 4096;
+    DeviceBuffer tree_ctl_, tree_direct_ctl_, tree_feats_;
+    uint32_t pending_tree_N_ = 0;
+    bool last_tree_direct_ = false;
+    double last_tree_direct_ms_ = 0.0;
+
     struct DirectShared;
     struct DirectBatchState;
+    struct DirectTreeState;
     std::unique_ptr<DirectShared> direct_shared_;
     std::unique_ptr<DirectBatchState> direct_b8_;
     std::unique_ptr<DirectBatchState> direct_b1_;
+    std::unique_ptr<DirectTreeState> direct_tree_;
     bool last_used_direct_b1_ = false;
     bool ensure_direct_shared(uint32_t nl);
     bool ensure_direct_plan(std::unique_ptr<DirectBatchState>& dst, uint32_t B, std::array<uint32_t, 8> slot_caps);
     bool ensure_direct_b8(std::array<uint32_t, 8> slot_caps);
     DirectBatchState* ensure_direct_b1(uint32_t cur_pos);
+    DirectTreeState* ensure_direct_tree(uint32_t N);
     void clear_direct_attn_caches();
 };
 

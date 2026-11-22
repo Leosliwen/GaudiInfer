@@ -25,6 +25,13 @@ foreach(KERNEL
         direct_attn_q_pack_f8_gaudi2
         direct_attn_tile_step_bf16_gaudi2
         direct_attn_tile_step_f8_gaudi2
+        direct_attn_tree_tile_step_bf16_gaudi2
+        direct_attn_tree_tile_step_f8_gaudi2
+        direct_dq_attn_tree_prep_bf16_gaudi2
+        direct_dq_attn_tree_prep_f8_gaudi2
+        direct_gdn_dq_tree_prep_bf16_gaudi2
+        direct_tree_feat_commit_bf16_gaudi2
+        direct_tree_kv_commit_bf16_gaudi2
         direct_conv_commit_bf16_gaudi2
         direct_dq_add_rmsnorm_quant_bf16_gaudi2
         direct_dq_add_rmsnorm_quant_dual_bf16_gaudi2
@@ -57,6 +64,9 @@ foreach(KERNEL
         gdn_spec_prep_batch_bf16_gaudi2
         gdn_spec_prep_bf16_gaudi2
         gdn_state_commit_f32_gaudi2
+        gdn_tree_commit_f32_gaudi2
+        gdn_tree_prep_bf16_gaudi2
+        gdn_tree_wy_f32_gaudi2
         masked_softmax_bf16_f8_gaudi2
         masked_softmax_bf16_gaudi2
         masked_softmax_f16_gaudi2

@@ -119,3 +119,21 @@ struct DSpineQkvPrepBf16Gaudi2 {
     tpc_lib_api::GlueCodeReturn GetGcDefinitions(tpc_lib_api::HabanaKernelParams* in,
                                                  tpc_lib_api::HabanaKernelInstantiation* out);
 };
+
+struct GdnTreePrepBf16Gaudi2 {
+    static constexpr const char* name = "flashinfer_gaudi_gdn_tree_prep_bf16_gaudi2";
+    tpc_lib_api::GlueCodeReturn GetGcDefinitions(tpc_lib_api::HabanaKernelParams* in,
+                                                 tpc_lib_api::HabanaKernelInstantiation* out);
+};
+
+struct GdnTreeWyF32Gaudi2 {
+    static constexpr const char* name = "flashinfer_gaudi_gdn_tree_wy_f32_gaudi2";
+    tpc_lib_api::GlueCodeReturn GetGcDefinitions(tpc_lib_api::HabanaKernelParams* in,
+                                                 tpc_lib_api::HabanaKernelInstantiation* out);
+};
+
+struct GdnTreeCommitF32Gaudi2 {
+    static constexpr const char* name = "flashinfer_gaudi_gdn_tree_commit_f32_gaudi2";
+    tpc_lib_api::GlueCodeReturn GetGcDefinitions(tpc_lib_api::HabanaKernelParams* in,
+                                                 tpc_lib_api::HabanaKernelInstantiation* out);
+};

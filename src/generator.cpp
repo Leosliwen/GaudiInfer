@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <numeric>
+#include <queue>
 #include <stdexcept>
 
 namespace g2e {
@@ -622,6 +623,196 @@ uint32_t Generator::plan_round(Task& t, uint32_t pos, const std::vector<int32_t>
     return committed;
 }
 
+namespace {
+
+// Deterministic Sequoia-style best-first prefix tree from DSpine's [15, 16, 16] transition table.
+// Zero target RNG is touched, so verifying and drawing directly from target distributions along the tree
+// is 100% mathematically exact and lossless for all (temperature, top_p, top_k, min_p).
+Qwen35::TreeSpec build_best_first_tree(int32_t anchor, const DSpine::SampledDraft& d, uint32_t max_nodes,
+                                       float draft_temp, uint32_t& valid_nodes) {
+    const uint32_t W = DSpine::kBlock, K = W;
+    const double inv_t = 1.0 / std::max(double(draft_temp), 1e-5);
+    auto row_logp = [&](uint32_t depth, uint32_t sender) {
+        const float* row = &d.table[(size_t(depth) * K + sender) * K];
+        double mx = -1e300;
+        for (uint32_t k = 0; k < K; ++k) mx = std::max(mx, double(row[k]) * inv_t);
+        double s = 0;
+        std::array<double, 16> lp{};
+        for (uint32_t k = 0; k < K; ++k) { lp[k] = double(row[k]) * inv_t - mx; s += std::exp(lp[k]); }
+        const double lse = std::log(s);
+        for (uint32_t k = 0; k < K; ++k) lp[k] -= lse;
+        return lp;
+    };
+
+    Qwen35::TreeSpec ts;
+    ts.tokens.reserve(max_nodes);
+    ts.parent.reserve(max_nodes);
+    ts.depth.reserve(max_nodes);
+    ts.tokens.push_back(anchor);
+    ts.parent.push_back(-1);
+    ts.depth.push_back(0);
+
+    struct Cand {
+        double logp;
+        int32_t tok;
+        int32_t parent;
+        uint32_t depth;
+        uint32_t sender;
+        bool operator<(const Cand& o) const { return logp < o.logp; }
+    };
+    std::priority_queue<Cand> pq;
+    auto push_children = [&](int32_t p_idx, uint32_t p_depth, uint32_t p_sender, double p_logp) {
+        if (p_depth >= W - 1) return;
+        const auto lp = row_logp(p_depth, p_sender);
+        for (uint32_t k = 0; k < K; ++k)
+            pq.push({p_logp + lp[k], d.cand[size_t(p_depth) * K + k], p_idx, p_depth + 1, k});
+    };
+    push_children(0, 0, 0, 0.0);
+
+    while (ts.tokens.size() < max_nodes && !pq.empty()) {
+        const Cand c = pq.top();
+        pq.pop();
+        bool dup = false;
+        for (size_t i = 1; i < ts.tokens.size(); ++i)
+            if (ts.parent[i] == c.parent && ts.tokens[i] == c.tok) { dup = true; break; }
+        if (dup) continue;
+        const int32_t idx = int32_t(ts.tokens.size());
+        ts.tokens.push_back(c.tok);
+        ts.parent.push_back(c.parent);
+        ts.depth.push_back(c.depth);
+        push_children(idx, c.depth, c.sender, c.logp);
+    }
+    valid_nodes = uint32_t(ts.tokens.size());
+    while (ts.tokens.size() < max_nodes) {
+        ts.tokens.push_back(anchor);
+        ts.parent.push_back(0);
+        ts.depth.push_back(1);
+    }
+    return ts;
+}
+
+}  // namespace
+
+void Generator::complete_tree_round(Task& t, uint32_t pos, const std::vector<int32_t>& win,
+                                    const std::vector<int32_t>& fresh) {
+    GenerationResult& r = t.r;
+    const uint32_t W = DSpine::kBlock;
+    const uint32_t a = uint32_t(win.size() - 1);
+    size_t c = fresh.size() - 1;
+    for (size_t k = 0; k < fresh.size(); ++k)
+        if (stop_token(t, fresh[k])) { c = k; break; }
+    c = std::min<size_t>(c, t.max_new - r.tokens.size() - 1);
+    const uint32_t committed = uint32_t(std::min<size_t>(a, c));
+
+    // Commit truncated winning path [win[0..committed]] into target KV/GDN + gather drafter features
+    model_.accept_tree(std::span<const int32_t>(win.data(), committed + 1));
+    drafter_->append_context(model_.tree_features(), model_.tree_feature_stride(), committed + 1, pos, UINT32_MAX, 0);
+
+    // Pre-draft next round's transition table immediately while device stream runs append_context
+    const int32_t next_anchor = fresh[c];
+    const uint32_t next_pos = pos + committed + 1;
+    const bool stops = c + 1 < fresh.size() || stop_token(t, fresh[c]);
+    if (!stops && r.tokens.size() + c + 1 < t.max_new && next_pos + W <= max_ctx_) {
+        next_.valid = true;
+        next_.sampled = true;
+        next_.want = false;
+        next_.pos = next_pos;
+        next_.anchor = next_anchor;
+        next_.table = drafter_->draft_table(next_anchor, next_pos);
+    }
+
+    history_.push_back(t.anchor);
+    history_.insert(history_.end(), fresh.begin(), fresh.begin() + long(committed));
+    ++r.rounds;
+    r.drafts_offered += W - 1;
+    r.drafts_accepted += committed;
+    round_ema_ = 0.8 * round_ema_ + 0.2 * double(a + 1);
+    std::vector<int32_t> keep(fresh.begin(), fresh.begin() + long(c) + 1);
+    deliver_keep(t, keep);
+}
+
+void Generator::tree_round(Task& t, uint32_t pos, uint32_t tree_nodes) {
+    const SamplingParams& p = t.params;
+    const uint32_t W = DSpine::kBlock;
+    static const float base_temp = [] {
+        const char* e = std::getenv("G2E_TREE_TEMP");
+        return e ? float(std::atof(e)) : 1.5f;
+    }();
+    const float draft_temp = p.greedy() ? base_temp : std::max(base_temp, p.temperature);
+    const auto d = take_table(t.anchor, pos);
+    uint32_t valid_nodes = 0;
+    const auto ts = build_best_first_tree(t.anchor, d, tree_nodes, draft_temp, valid_nodes);
+
+    std::vector<int32_t> win = {0};
+    std::vector<int32_t> fresh;
+    win.reserve(W);
+    fresh.reserve(W);
+
+    if (p.greedy()) {
+        const auto tgt = model_.verify_tree(ts);
+        int32_t cur = 0;
+        while (win.size() < W) {
+            const int32_t want = tgt[size_t(cur)];
+            int32_t child = -1;
+            for (uint32_t i = 1; i < valid_nodes; ++i) {
+                if (ts.parent[i] == cur && ts.tokens[i] == want) { child = int32_t(i); break; }
+            }
+            fresh.push_back(want);
+            if (child < 0) break;
+            win.push_back(child);
+            cur = child;
+        }
+        if (fresh.size() < win.size()) fresh.push_back(tgt[size_t(cur)]);
+    } else {
+        const double inv_t = 1.0 / std::max(double(p.temperature), 1e-5);
+        const auto v = model_.verify_tree_topk(ts, float(inv_t));
+        const uint32_t C = Qwen35::kTopK;
+        const int target_k = p.top_k <= 0 ? int(C) : std::min(p.top_k, int(C));
+        auto sample_node = [&](int32_t node) -> int32_t {
+            const size_t t_idx = size_t(node);
+            std::array<size_t, Qwen35::kTopK> order{};
+            std::iota(order.begin(), order.end(), 0);
+            std::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+                const float va = v.values[t_idx * C + a], vb = v.values[t_idx * C + b];
+                return va > vb || (va == vb && v.ids[t_idx * C + a] < v.ids[t_idx * C + b]);
+            });
+            const double mx = v.max[t_idx], sum = v.sum[t_idx];
+            double before = 0, kept = 0;
+            const double pmax = std::exp(double(v.values[t_idx * C + order[0]]) - mx) / sum;
+            std::vector<int32_t> cand_ids;
+            std::vector<double> cand_w;
+            cand_ids.reserve(C);
+            cand_w.reserve(C);
+            for (size_t r = 0; r < C; ++r) {
+                const size_t j = order[r];
+                const double pf = std::exp(double(v.values[t_idx * C + j]) - mx) / sum;
+                const bool keep = int(r) < target_k && before <= double(p.top_p) &&
+                                  (p.min_p <= 0 || pf >= double(p.min_p) * pmax);
+                if (keep) { cand_ids.push_back(v.ids[t_idx * C + j]); cand_w.push_back(pf); kept += pf; }
+                before += pf;
+            }
+            if (cand_ids.empty()) return v.ids[t_idx * C + order[0]];
+            for (double& w : cand_w) w /= kept;
+            return cand_ids[draw(cand_w, uniform())];
+        };
+
+        int32_t cur = 0;
+        while (true) {
+            const int32_t y = sample_node(cur);
+            fresh.push_back(y);
+            if (win.size() >= W) break;
+            int32_t child = -1;
+            for (uint32_t i = 1; i < valid_nodes; ++i) {
+                if (ts.parent[i] == cur && ts.tokens[i] == y) { child = int32_t(i); break; }
+            }
+            if (child < 0) break;
+            win.push_back(child);
+            cur = child;
+        }
+    }
+    complete_tree_round(t, pos, win, fresh);
+}
+
 void Generator::decode_round(Task& t) {
     GenerationResult& r = t.r;
     const SamplingParams& params = t.params;
@@ -629,6 +820,18 @@ void Generator::decode_round(Task& t) {
     if (!room_for_round(t)) return;
     const uint32_t pos = model_.position();
     if (drafter_ && pos + W <= cap()) {
+        static const uint32_t tree_nodes = [] {
+            const char* e = std::getenv("G2E_TREE_NODES");
+            return e ? uint32_t(std::atoi(e)) : 24u;
+        }();
+        static const uint32_t tree_max_pos = [] {
+            const char* e = std::getenv("G2E_TREE_MAX_POS");
+            return e ? uint32_t(std::atoi(e)) : 0u;
+        }();
+        if (tree_nodes >= 2 && model_.tree_supported() && (tree_max_pos == 0 || pos < tree_max_pos)) {
+            tree_round(t, pos, tree_nodes);
+            return;
+        }
         std::vector<int32_t> drafts, fresh;
         uint32_t a = 0;
         if (params.greedy()) {

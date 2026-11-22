@@ -44,6 +44,12 @@ extern unsigned char _binary_dspine_bridge_post_bf16_gaudi2_o_start;
 extern unsigned char _binary_dspine_bridge_post_bf16_gaudi2_o_end;
 extern unsigned char _binary_dspine_qkv_prep_bf16_gaudi2_o_start;
 extern unsigned char _binary_dspine_qkv_prep_bf16_gaudi2_o_end;
+extern unsigned char _binary_gdn_tree_prep_bf16_gaudi2_o_start;
+extern unsigned char _binary_gdn_tree_prep_bf16_gaudi2_o_end;
+extern unsigned char _binary_gdn_tree_wy_f32_gaudi2_o_start;
+extern unsigned char _binary_gdn_tree_wy_f32_gaudi2_o_end;
+extern unsigned char _binary_gdn_tree_commit_f32_gaudi2_o_start;
+extern unsigned char _binary_gdn_tree_commit_f32_gaudi2_o_end;
 
 namespace {
 using namespace tpc_lib_api;
@@ -585,4 +591,90 @@ GlueCodeReturn DSpineQkvPrepBf16Gaudi2::GetGcDefinitions(HabanaKernelParams* in,
     out->kernel.paramsNr = 2;
     std::memcpy(&out->kernel.scalarParams[0], in->nodeParams.nodeParams, 2 * sizeof(float));
     return Elf(out, &_binary_dspine_qkv_prep_bf16_gaudi2_o_start, &_binary_dspine_qkv_prep_bf16_gaudi2_o_end);
+}
+
+GlueCodeReturn GdnTreePrepBf16Gaudi2::GetGcDefinitions(HabanaKernelParams* in, HabanaKernelInstantiation* out)
+{
+    if (in->inputTensorNr != 3) { in->inputTensorNr = 3; return GLUE_INCOMPATIBLE_INPUT_COUNT; }
+    if (in->outputTensorNr != 2) { in->outputTensorNr = 2; return GLUE_INCOMPATIBLE_OUTPUT_COUNT; }
+    const auto& seq = in->inputTensors[0].geometry;
+    const uint64_t C = seq.maxSizes[0], rows = seq.maxSizes[1];
+    if (seq.dataType != DATA_BF16 || seq.dims != 2 || C % 128 || C <= 4096 || rows < 4)
+        return GLUE_INCOMPATIBLE_INPUT_SIZE;
+    const uint64_t N = rows - 3;
+    if (!Is(in->inputTensors[1], DATA_BF16, {C, 4}) || !Is(in->inputTensors[2], DATA_I32, {4, N}))
+        return GLUE_INCOMPATIBLE_INPUT_SIZE;
+    if (!Is(in->outputTensors[0], DATA_F32, {128, 2 * N, 16}) || !Is(in->outputTensors[1], DATA_F32, {C - 4096, N}))
+        return GLUE_INCOMPATIBLE_OUTPUT_SIZE;
+    out->indexSpaceRank = 1;
+    out->indexSpaceGeometry[0] = C / 128;
+    for (unsigned i = 0; i < 3; ++i) out->inputTensorAccessPattern[i].allRequired = true;
+    for (unsigned o = 0; o < 2; ++o) out->outputTensorAccessPattern[o].allRequired = true;
+    out->kernel.paramsNr = 0;
+    return Elf(out, &_binary_gdn_tree_prep_bf16_gaudi2_o_start, &_binary_gdn_tree_prep_bf16_gaudi2_o_end);
+}
+
+GlueCodeReturn GdnTreeWyF32Gaudi2::GetGcDefinitions(HabanaKernelParams* in, HabanaKernelInstantiation* out)
+{
+    if (in->inputTensorNr != 6) { in->inputTensorNr = 6; return GLUE_INCOMPATIBLE_INPUT_COUNT; }
+    if (in->outputTensorNr != 2) { in->outputTensorNr = 2; return GLUE_INCOMPATIBLE_OUTPUT_COUNT; }
+    const auto* t = in->inputTensors;
+    const auto& vg = t[4].geometry;
+    if (vg.dataType != DATA_F32 || vg.dims != 3 || vg.maxSizes[0] != 128 || vg.maxSizes[1] != 48 ||
+        vg.maxSizes[2] == 0 || vg.maxSizes[2] > 64)
+        return GLUE_INCOMPATIBLE_INPUT_SIZE;
+    const uint64_t N = vg.maxSizes[2];
+    if (!Is(t[0], DATA_F32, {48, N}) || !Is(t[1], DATA_F32, {48, N}) ||
+        !Is(t[2], DATA_F32, {384, 2 * N, 16}) || !Is(t[3], DATA_F32, {2 * N, 2 * N, 16}) ||
+        !Is(t[5], DATA_I32, {N}))
+        return GLUE_INCOMPATIBLE_INPUT_SIZE;
+    if (!Is(in->outputTensors[0], DATA_F32, {128, 48, N}) ||
+        !Is(in->outputTensors[1], DATA_F32, {128, 48, N}))
+        return GLUE_INCOMPATIBLE_OUTPUT_SIZE;
+    out->indexSpaceRank = 1;
+    out->indexSpaceGeometry[0] = 48;
+    for (unsigned i = 0; i < 6; ++i) out->inputTensorAccessPattern[i].allRequired = true;
+    for (unsigned o = 0; o < 2; ++o) {
+        Map(out->outputTensorAccessPattern[o], 0, 0, 0, 0, 127);
+        Map(out->outputTensorAccessPattern[o], 1, 0, 1, 0, 0);
+        Map(out->outputTensorAccessPattern[o], 2, 0, 0, 0, static_cast<int>(N - 1));
+    }
+    out->kernel.paramsNr = 0;
+    return Elf(out, &_binary_gdn_tree_wy_f32_gaudi2_o_start, &_binary_gdn_tree_wy_f32_gaudi2_o_end);
+}
+
+GlueCodeReturn GdnTreeCommitF32Gaudi2::GetGcDefinitions(HabanaKernelParams* in, HabanaKernelInstantiation* out)
+{
+    if (in->inputTensorNr != 5) { in->inputTensorNr = 5; return GLUE_INCOMPATIBLE_INPUT_COUNT; }
+    if (in->outputTensorNr != 1) { in->outputTensorNr = 1; return GLUE_INCOMPATIBLE_OUTPUT_COUNT; }
+    const auto* t = in->inputTensors;
+    const auto& sg = t[0].geometry;
+    const auto& xg = t[1].geometry;
+    const auto& dg = t[2].geometry;
+    if (sg.dataType != DATA_F32 || sg.dims != 3 || sg.maxSizes[0] != 128 || sg.maxSizes[1] != 128 ||
+        sg.maxSizes[2] == 0 || sg.maxSizes[2] % 48 != 0)
+        return GLUE_INCOMPATIBLE_INPUT_SIZE;
+    const uint64_t NG = sg.maxSizes[2] / 48;
+    if (dg.dataType != DATA_F32 || dg.dims != 4 || dg.maxSizes[0] != 128 || dg.maxSizes[1] != 48 ||
+        dg.maxSizes[2] == 0 || dg.maxSizes[2] > 64 || dg.maxSizes[3] != NG)
+        return GLUE_INCOMPATIBLE_INPUT_SIZE;
+    const uint64_t N = dg.maxSizes[2];
+    if (xg.dataType != DATA_F32 || xg.dims != 4 || xg.maxSizes[0] != 128 ||
+        (xg.maxSizes[1] != N && xg.maxSizes[1] != 2 * N) || xg.maxSizes[2] != 16 || xg.maxSizes[3] != NG)
+        return GLUE_INCOMPATIBLE_INPUT_SIZE;
+    if (!Is(t[3], DATA_F32, {48, N, NG}) || !Is(t[4], DATA_I32, {17}))
+        return GLUE_INCOMPATIBLE_INPUT_SIZE;
+    if (!Is(in->outputTensors[0], DATA_F32, {128, 128, NG * 48}))
+        return GLUE_INCOMPATIBLE_OUTPUT_SIZE;
+    out->indexSpaceRank = 1;
+    out->indexSpaceGeometry[0] = NG * 48;
+    Map(out->inputTensorAccessPattern[0], 0, 0, 0, 0, 127);
+    Map(out->inputTensorAccessPattern[0], 1, 0, 0, 0, 127);
+    Map(out->inputTensorAccessPattern[0], 2, 0, 1, 0, 0);
+    for (unsigned i = 1; i < 5; ++i) out->inputTensorAccessPattern[i].allRequired = true;
+    Map(out->outputTensorAccessPattern[0], 0, 0, 0, 0, 127);
+    Map(out->outputTensorAccessPattern[0], 1, 0, 0, 0, 127);
+    Map(out->outputTensorAccessPattern[0], 2, 0, 1, 0, 0);
+    out->kernel.paramsNr = 0;
+    return Elf(out, &_binary_gdn_tree_commit_f32_gaudi2_o_start, &_binary_gdn_tree_commit_f32_gaudi2_o_end);
 }
