@@ -4,6 +4,9 @@
 #include <algorithm>
 #include <cfenv>
 #include <cmath>
+#include <cstring>
+#include <dlfcn.h>
+#include <mutex>
 #include <stdexcept>
 
 #define STB_IMAGE_IMPLEMENTATION
@@ -107,7 +110,43 @@ std::vector<uint8_t> resize_rgb(const uint8_t* src, int w, int h, int ow, int oh
 
 }  // namespace
 
+namespace {
+
+bool is_webp(const uint8_t* data, size_t size) {
+    return data && size >= 12 && std::memcmp(data, "RIFF", 4) == 0 && std::memcmp(data + 8, "WEBP", 4) == 0;
+}
+
+std::vector<uint8_t> decode_webp(const uint8_t* data, size_t size, int& width, int& height) {
+    using DecodeRGBFn = uint8_t* (*)(const uint8_t*, size_t, int*, int*);
+    using FreeFn = void (*)(void*);
+    static DecodeRGBFn decode_rgb = nullptr;
+    static FreeFn webp_free = nullptr;
+    static std::once_flag init_flag;
+    std::call_once(init_flag, []() {
+        void* handle = dlopen("libwebp.so.7", RTLD_LAZY);
+        if (!handle) handle = dlopen("libwebp.so", RTLD_LAZY);
+        if (handle) {
+            decode_rgb = reinterpret_cast<DecodeRGBFn>(dlsym(handle, "WebPDecodeRGB"));
+            webp_free = reinterpret_cast<FreeFn>(dlsym(handle, "WebPFree"));
+        }
+    });
+    if (!decode_rgb || !webp_free) {
+        throw std::invalid_argument("cannot decode the image: WebP image requires libwebp (libwebp.so.7)");
+    }
+    uint8_t* px = decode_rgb(data, size, &width, &height);
+    if (!px || width <= 0 || height <= 0) {
+        if (px) webp_free(px);
+        throw std::invalid_argument("cannot decode the image: invalid or corrupt WebP");
+    }
+    std::vector<uint8_t> rgb(px, px + size_t(width) * size_t(height) * 3);
+    webp_free(px);
+    return rgb;
+}
+
+}  // namespace
+
 std::vector<uint8_t> decode_image(const uint8_t* data, size_t size, int& width, int& height) {
+    if (is_webp(data, size)) return decode_webp(data, size, width, height);
     int channels = 0;
     stbi_uc* px = stbi_load_from_memory(data, int(size), &width, &height, &channels, 3);
     if (!px) throw std::invalid_argument(std::string("cannot decode the image: ") + stbi_failure_reason());
